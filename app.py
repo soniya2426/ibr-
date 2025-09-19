@@ -7,14 +7,15 @@ import matplotlib.pyplot as plt
 import plotly.express as px
 import seaborn as sns
 
+from typing import Optional, Tuple, List
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelBinarizer, LabelEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelBinarizer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, roc_curve, auc, RocCurveDisplay, r2_score,
-    mean_absolute_error, mean_squared_error, classification_report
+    confusion_matrix, roc_curve, auc, r2_score,
+    mean_absolute_error, mean_squared_error
 )
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
@@ -33,22 +34,45 @@ def load_excel(path: str, sheet_name: str):
     return df
 
 @st.cache_data
-def read_uploaded_file(uploaded_file, excel_sheet: str | None):
-    """Read uploaded file. If Excel, allow sheet selection."""
+def read_uploaded_file(uploaded_file, excel_sheet: Optional[str]) -> Tuple[pd.DataFrame, Optional[List[str]], Optional[str]]:
+    """
+    Read uploaded file. If Excel, allow sheet selection.
+    Parquet is attempted but may fail in hosted environments without pyarrow/fastparquet.
+    Returns: (df, sheet_names_or_None, selected_sheet_or_None)
+    """
     name = uploaded_file.name.lower()
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        # If sheet is provided, read that; else read first sheet
-        if excel_sheet is None:
+    if name.endswith((".xlsx", ".xls")):
+        try:
             xls = pd.ExcelFile(uploaded_file)
-            first = xls.sheet_names[0]
-            return pd.read_excel(xls, sheet_name=first), xls.sheet_names, first
-        else:
-            xls = pd.ExcelFile(uploaded_file)
-            return pd.read_excel(xls, sheet_name=excel_sheet), xls.sheet_names, excel_sheet
+            if excel_sheet is None:
+                first = xls.sheet_names[0]
+                return pd.read_excel(xls, sheet_name=first), xls.sheet_names, first
+            else:
+                return pd.read_excel(xls, sheet_name=excel_sheet), xls.sheet_names, excel_sheet
+        except Exception as e:
+            raise RuntimeError(f"Failed to read Excel file: {e}")
     elif name.endswith(".csv"):
-        return pd.read_csv(uploaded_file), None, None
+        try:
+            return pd.read_csv(uploaded_file), None, None
+        except Exception as e:
+            raise RuntimeError(f"Failed to read CSV file: {e}")
+    elif name.endswith(".parquet"):
+        # Parquet requires pyarrow or fastparquet. If not present, provide actionable message.
+        try:
+            df = pd.read_parquet(uploaded_file)
+            return df, None, None
+        except Exception:
+            raise RuntimeError(
+                "Reading parquet failed. The hosted environment may not have pyarrow/fastparquet installed. "
+                "Please upload CSV or Excel (XLSX)."
+            )
     else:
-        return pd.read_parquet(uploaded_file), None, None
+        # fallback attempt
+        try:
+            df = pd.read_parquet(uploaded_file)
+            return df, None, None
+        except Exception as e:
+            raise RuntimeError(f"Unsupported filetype or read error: {e}")
 
 @st.cache_data
 def detect_column_types(df: pd.DataFrame):
@@ -90,13 +114,21 @@ with st.sidebar:
 
     if uploaded is not None and (uploaded.name.lower().endswith(".xlsx") or uploaded.name.lower().endswith(".xls")):
         # First pass to get sheet names
-        _df_tmp, sheet_names, current = read_uploaded_file(uploaded, None)
-        excel_sheet = st.selectbox("Excel sheet", sheet_names, index=sheet_names.index(current) if current in sheet_names else 0)
-        df, _, _ = read_uploaded_file(uploaded, excel_sheet)
-        st.success(f"Loaded uploaded Excel: sheet '{excel_sheet}' — shape {df.shape}.")
+        try:
+            _df_tmp, sheet_names, current = read_uploaded_file(uploaded, None)
+            excel_sheet = st.selectbox("Excel sheet", sheet_names, index=sheet_names.index(current) if current in sheet_names else 0)
+            df, _, _ = read_uploaded_file(uploaded, excel_sheet)
+            st.success(f"Loaded uploaded Excel: sheet '{excel_sheet}' — shape {df.shape}.")
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
     elif uploaded is not None:
-        df, _, _ = read_uploaded_file(uploaded, None)
-        st.success(f"Loaded uploaded file — shape {df.shape}.")
+        try:
+            df, _, _ = read_uploaded_file(uploaded, None)
+            st.success(f"Loaded uploaded file — shape {df.shape}.")
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
     else:
         # Fallback to default packaged dataset
         try:
@@ -244,7 +276,7 @@ with tab2:
     test_size = st.slider("Test size", 0.1, 0.5, 0.2, step=0.05)
     random_state = st.number_input("Random state", value=42, step=1)
     models_to_run = st.multiselect(
-        "Choose algorithms", 
+        "Choose algorithms",
         ["KNN", "Decision Tree", "Random Forest", "Gradient Boosting"],
         default=["KNN", "Decision Tree", "Random Forest", "Gradient Boosting"]
     )
@@ -308,15 +340,15 @@ with tab2:
     if model_for_cm:
         best = trained[model_for_cm]
         y_pred = best.predict(X_test)
-        cm = confusion_matrix(y_test, y_pred, labels=sorted(pd.Series(y_test).unique()))
-        cm_df = pd.DataFrame(cm, index=[f"True {l}" for l in sorted(pd.Series(y_test).unique())], columns=[f"Pred {l}" for l in sorted(pd.Series(y_test).unique())])
+        labels_sorted = sorted(pd.Series(y_test).unique())
+        cm = confusion_matrix(y_test, y_pred, labels=labels_sorted)
+        cm_df = pd.DataFrame(cm, index=[f"True {l}" for l in labels_sorted], columns=[f"Pred {l}" for l in labels_sorted])
         st.dataframe(cm_df)
         st.caption("**What this shows:** Correct vs misclassified counts per class; strong diagonal indicates good performance.")
 
     # ROC Curves
     st.subheader("ROC Curves (All Selected Models)")
     fig_roc, ax_roc = plt.subplots(figsize=(7,5))
-    classes = sorted(pd.Series(y_test).unique())
     for mname in models_to_run:
         model = trained[mname]
         try:
@@ -348,4 +380,173 @@ with tab2:
     # Batch Predict New Data
     st.subheader("Batch Predict on New Data")
     model_for_pred = st.selectbox("Model to use for prediction", models_to_run, key="pred_model")
-    file_new = st.file_uploader("Upload new data for prediction (without target column)", type=["xlsx","xls","csv","parquet"], key
+    file_new = st.file_uploader("Upload new data for prediction (without target column)", type=["xlsx","xls","csv","parquet"], key="pred_upload")
+    if file_new is not None:
+        try:
+            if file_new.name.lower().endswith((".xlsx", ".xls")):
+                xls_pred = pd.ExcelFile(file_new)
+                sheet_pred = st.selectbox("Sheet for prediction file", xls_pred.sheet_names)
+                new_df = pd.read_excel(xls_pred, sheet_name=sheet_pred)
+            elif file_new.name.lower().endswith(".csv"):
+                new_df = pd.read_csv(file_new)
+            else:
+                # parquet attempt; may raise RuntimeError if pyarrow is missing
+                new_df = pd.read_parquet(file_new)
+            preds = trained[model_for_pred].predict(new_df)
+            out = new_df.copy()
+            out["prediction"] = preds
+            st.dataframe(out.head(20))
+            csv_bytes = out.to_csv(index=False).encode("utf-8")
+            st.download_button("Download predictions", csv_bytes, file_name="predictions.csv", mime="text/csv")
+        except Exception as e:
+            st.error(str(e))
+            st.info("If you uploaded a parquet file and see this error, upload CSV/XLSX instead or install pyarrow/fastparquet in your environment.")
+
+# ------------------- Tab 3: Clustering -------------------
+with tab3:
+    st.header("K-Means Clustering")
+    num_cols, cat_cols = detect_column_types(df)
+    features = st.multiselect("Select features for clustering (numeric recommended)", df.columns.tolist(), default=[c for c in num_cols][: min(6, len(num_cols))])
+    if not features:
+        st.warning("Select at least one feature to proceed.")
+    else:
+        work = df[features].copy()
+        work = work.select_dtypes(include=[np.number]).dropna()
+        if work.empty:
+            st.error("No numeric data available for clustering after dropping NA.")
+        else:
+            st.subheader("Elbow Plot")
+            inertias = []
+            K_range = range(2, 11)
+            for k in K_range:
+                km = KMeans(n_clusters=k, n_init=10, random_state=42)
+                km.fit(work)
+                inertias.append(km.inertia_)
+            fig_elb = px.line(x=list(K_range), y=inertias, labels={"x":"K (clusters)","y":"Inertia"})
+            st.plotly_chart(fig_elb, use_container_width=True)
+            st.caption("**What this shows:** How within-cluster variance decreases with K; look for an 'elbow' where improvements taper.")
+
+            k_sel = st.slider("Number of clusters", min_value=2, max_value=10, value=3, step=1)
+            km2 = KMeans(n_clusters=k_sel, n_init=10, random_state=42).fit(work)
+            labels = km2.labels_
+            df_clusters = df.copy()
+            df_clusters["cluster"] = labels
+            st.subheader("Cluster Personas (Numeric feature means)")
+            persona = df_clusters.groupby("cluster")[features].mean(numeric_only=True).round(2)
+            st.dataframe(persona)
+            st.caption("**What this shows:** Average profile per cluster; use to label customer personas.")
+
+            download_dataframe_button(df_clusters, "data_with_clusters.csv", "Download full data with cluster labels")
+
+# ------------------- Tab 4: Association Rules -------------------
+with tab4:
+    st.header("Association Rule Mining (Apriori)")
+    _, cat_cols = detect_column_types(df)
+    cat_choices = st.multiselect("Choose 2 or more categorical columns", cat_cols, default=cat_cols[:2] if len(cat_cols)>=2 else cat_cols)
+    min_support = st.slider("Min Support", 0.01, 0.5, 0.05, 0.01)
+    min_conf = st.slider("Min Confidence", 0.0, 1.0, 0.3, 0.05)
+    min_lift = st.slider("Min Lift", 0.5, 5.0, 1.0, 0.1)
+
+    if len(cat_choices) >= 2:
+        basket = pd.DataFrame()
+        for c in cat_choices:
+            dummies = pd.get_dummies(df[c].astype(str), prefix=c)
+            basket = pd.concat([basket, dummies], axis=1)
+        freq = apriori(basket, min_support=min_support, use_colnames=True)
+        if not freq.empty:
+            rules = association_rules(freq, metric="confidence", min_threshold=min_conf)
+            rules = rules[rules["lift"] >= min_lift].sort_values("lift", ascending=False)
+            rules["antecedents"] = rules["antecedents"].apply(lambda s: ", ".join(sorted(list(s))))
+            rules["consequents"] = rules["consequents"].apply(lambda s: ", ".join(sorted(list(s))))
+            show_cols = ["antecedents","consequents","support","confidence","lift"]
+            st.subheader("Top 10 Associations")
+            st.dataframe(rules[show_cols].head(10).round(3))
+            st.caption("**What this shows:** Strong co-occurrence patterns among selected categorical attributes.")
+        else:
+            st.warning("No frequent itemsets found at current support threshold. Try lowering it.")
+    else:
+        st.info("Select at least two categorical columns to run Apriori.")
+
+# ------------------- Tab 5: Regression -------------------
+with tab5:
+    st.header("Regression (Quick Insights)")
+    num_cols, cat_cols = detect_column_types(df)
+    numeric_targets = [c for c in num_cols if df[c].nunique() > 10]
+    if not numeric_targets:
+        st.warning("No suitable numeric targets detected (with >10 unique values).")
+    else:
+        target_r = st.selectbox("Select numeric target", numeric_targets)
+        features_r = st.multiselect("Select features (exclude target)", [c for c in df.columns if c != target_r], default=[c for c in num_cols if c != target_r][: min(6, len(num_cols))])
+        test_size_r = st.slider("Test size", 0.1, 0.5, 0.2, step=0.05, key="reg_ts")
+
+        X = df[features_r].copy()
+        y = df[target_r].copy()
+
+        num_c = X.select_dtypes(include=[np.number]).columns.tolist()
+        cat_c = X.select_dtypes(exclude=[np.number]).columns.tolist()
+        numeric_transformer = Pipeline(steps=[("scaler", StandardScaler(with_mean=False))])
+        categorical_transformer = Pipeline(steps=[("onehot", OneHotEncoder(handle_unknown="ignore"))])
+        preprocessor = ColumnTransformer(
+            transformers=[("num", numeric_transformer, num_c), ("cat", categorical_transformer, cat_c)]
+        )
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size_r, random_state=42)
+
+        regs = {
+            "Linear": LinearRegression(),
+            "Ridge": Ridge(alpha=1.0, random_state=42),
+            "Lasso": Lasso(alpha=0.001, max_iter=10000, random_state=42),
+            "Decision Tree": DecisionTreeRegressor(random_state=42)
+        }
+
+        rows = []
+        trained_r = {}
+        for name, model in regs.items():
+            pipe = Pipeline(steps=[("pre", preprocessor), ("reg", model)])
+            pipe.fit(X_train, y_train)
+            trained_r[name] = pipe
+            pred_tr = pipe.predict(X_train)
+            pred_te = pipe.predict(X_test)
+            r2_tr = r2_score(y_train, pred_tr)
+            r2_te = r2_score(y_test, pred_te)
+            mae = mean_absolute_error(y_test, pred_te)
+            rmse = mean_squared_error(y_test, pred_te, squared=False)
+            rows.append([name, r2_tr, r2_te, mae, rmse])
+
+        met = pd.DataFrame(rows, columns=["Model","R2 (train)","R2 (test)","MAE","RMSE"])
+        st.subheader("Model Comparison")
+        st.dataframe(met.round(3))
+        st.caption("**What this shows:** Fit quality and error magnitudes; compare for bias-variance trade-offs.")
+
+        st.subheader("Quick Insights")
+        st.write("- Coefficients/feature importance (where available)")
+        for name in ["Linear", "Ridge", "Lasso", "Decision Tree"]:
+            model = trained_r[name]
+            pre = model.named_steps["pre"]
+            ohe = pre.named_transformers_["cat"].named_steps["onehot"] if cat_c else None
+            num_feats = num_c
+            cat_feats = list(ohe.get_feature_names_out(cat_c)) if ohe is not None else []
+            feat_names = np.array(num_feats + cat_feats)
+            try:
+                reg = model.named_steps["reg"]
+                if hasattr(reg, "coef_"):
+                    coefs = np.ravel(reg.coef_)
+                    imp = pd.Series(coefs, index=feat_names).sort_values(key=lambda x: np.abs(x), ascending=False).head(10)
+                    st.write(f"**Top drivers — {name}**")
+                    st.dataframe(imp.round(4))
+                elif hasattr(reg, "feature_importances_"):
+                    fi = pd.Series(reg.feature_importances_, index=feat_names).sort_values(ascending=False).head(10)
+                    st.write(f"**Top drivers — {name}**")
+                    st.dataframe(fi.round(4))
+            except Exception as e:
+                st.info(f"{name}: could not compute feature contributions ({e}).")
+
+# ------------------- Tab 6: About -------------------
+with tab6:
+    st.header("About this App")
+    st.markdown("""
+    This dashboard was generated for the IBR 2 project to support analysis for **Shiffa** and **Estée Lauder**.
+    Use the sidebar to upload Excel directly (choose the sheet), apply global filters, and explore each tab for tailored analytics.
+    """)
+    st.markdown("""
+    **Credits:** Streamlit, scikit-learn, mlxtend, Plotly, Seaborn, Matplotlib.
+    """)
