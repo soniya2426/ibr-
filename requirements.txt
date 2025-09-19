@@ -7,3 +7,4 @@ plotly==5.23.0
 seaborn==0.13.2
 mlxtend==0.23.1
 openpyxl==3.1.5
+# pyarrow removed due to build issues on Streamlit Cloud; use CSV/XLSX for uploads
